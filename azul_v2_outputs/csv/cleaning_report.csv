@@ -1,0 +1,13 @@
+Step,RowsRemoved_or_Count
+initial_rows_after_required_fields,288337
+missing_fuel_removed,0
+nonpositive_fuel_removed,4
+missing_distance_removed,0
+nonpositive_distance_removed,0
+missing_time_removed,0
+trip_time_below_600_sec_removed,29
+missing_tow_removed,0
+implausible_tow_removed,0
+implausible_fuel_per_nm_removed,1
+implausible_ground_speed_removed,196
+final_rows,288107
