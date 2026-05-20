@@ -336,6 +336,9 @@ def add_fuel_savings_estimates(recs: pd.DataFrame, eq_route_fuel: pd.DataFrame):
     # Default values
     recs["RecommendedAircraft"] = recs["PrimaryAircraft"]
     recs["RecommendedAircraftFuelPerNM"] = np.nan
+    recs["EstimatedFuelSavedKgPerRouteMonth"] = np.nan
+    recs["EstimatedFuelSavedPercentOfRouteMonthFuel"] = np.nan
+    # Backward-compatible aliases retained for downstream files that already read these names.
     recs["EstimatedFuelSavedKg"] = np.nan
     recs["EstimatedFuelSavedPercent"] = np.nan
 
@@ -368,20 +371,35 @@ def add_fuel_savings_estimates(recs: pd.DataFrame, eq_route_fuel: pd.DataFrame):
         if col not in recs.columns:
             return recs
 
-    recs["EstimatedFuelSavedKg"] = (
+    valid_savings_mask = (
+        e1_to_e2_mask
+        & recs["AvgFuelPerNM"].notna()
+        & recs["RecommendedAircraftFuelPerNM"].notna()
+        & recs["AvgDistanceNM"].notna()
+        & recs["Flights"].notna()
+    )
+
+    recs.loc[valid_savings_mask, "EstimatedFuelSavedKgPerRouteMonth"] = (
         (recs["AvgFuelPerNM"] - recs["RecommendedAircraftFuelPerNM"])
         * recs["AvgDistanceNM"]
         * recs["Flights"]
     )
 
-    # Do not allow negative savings to appear as positive recommendation
-    recs.loc[recs["EstimatedFuelSavedKg"] < 0, "EstimatedFuelSavedKg"] = 0
+    # Do not allow negative savings to appear as positive recommendation.
+    recs.loc[
+        recs["EstimatedFuelSavedKgPerRouteMonth"] < 0,
+        "EstimatedFuelSavedKgPerRouteMonth",
+    ] = 0
 
-    # Percent savings compared to current monthly fuel burn
+    # Percent savings compared to current route-month fuel burn.
     if "FuelBurnKg" in recs.columns:
-        recs["EstimatedFuelSavedPercent"] = (
-            recs["EstimatedFuelSavedKg"] / recs["FuelBurnKg"]
+        recs.loc[valid_savings_mask, "EstimatedFuelSavedPercentOfRouteMonthFuel"] = (
+            recs.loc[valid_savings_mask, "EstimatedFuelSavedKgPerRouteMonth"]
+            / recs.loc[valid_savings_mask, "FuelBurnKg"]
         )
+
+    recs["EstimatedFuelSavedKg"] = recs["EstimatedFuelSavedKgPerRouteMonth"]
+    recs["EstimatedFuelSavedPercent"] = recs["EstimatedFuelSavedPercentOfRouteMonthFuel"]
 
     return recs
 # ==========================================================
@@ -698,13 +716,30 @@ def summarize_routes(recs: pd.DataFrame):
     if "AvgFuelPerNM" in recs.columns:
         agg_dict["AvgFuelPerNM"] = ("AvgFuelPerNM", "mean")
 
-    if "EstimatedFuelSavedKg" in recs.columns:
-        agg_dict["EstimatedFuelSavedKg"] = ("EstimatedFuelSavedKg", "sum")
+    savings_col = None
+    if "EstimatedFuelSavedKgPerRouteMonth" in recs.columns:
+        savings_col = "EstimatedFuelSavedKgPerRouteMonth"
+        agg_dict["EstimatedFuelSavedKgOverObservedRouteMonths"] = (
+            savings_col,
+            lambda s: s.sum(min_count=1),
+        )
+    elif "EstimatedFuelSavedKg" in recs.columns:
+        savings_col = "EstimatedFuelSavedKg"
+        agg_dict["EstimatedFuelSavedKgOverObservedRouteMonths"] = (
+            savings_col,
+            lambda s: s.sum(min_count=1),
+        )
+
+    sort_cols = ["MaxPriorityScore", "TotalFlights"]
+    ascending = [False, False]
+    if savings_col is not None:
+        sort_cols = ["EstimatedFuelSavedKgOverObservedRouteMonths"] + sort_cols
+        ascending = [False] + ascending
 
     return (
         recs.groupby(["Route", "Recommendation"], as_index=False)
         .agg(**agg_dict)
-        .sort_values(["EstimatedFuelSavedKg", "MaxPriorityScore", "TotalFlights"], ascending=[False, False, False])
+        .sort_values(sort_cols, ascending=ascending)
     )
 
 
@@ -724,9 +759,9 @@ def plot_regimes(regimes, output_dir):
             solid_capstyle="round",
         )
         ax.scatter(row["MedianTOW"], row["Aircraft"], s=60, zorder=3)
-    ax.set_title("Aircraft TOW Operating Regimes")
-    ax.set_xlabel("Takeoff Weight (kg)")
-    ax.set_ylabel("Aircraft")
+    ax.set_title("Aircraft TOW Operating Regimes (central operating band)")
+    ax.set_xlabel("Take-off weight, TOW (kg)")
+    ax.set_ylabel("Aircraft type")
     fig.tight_layout()
     fig.savefig(output_dir / "plots" / "aircraft_tow_regimes.png", dpi=200)
     plt.close(fig)
@@ -737,7 +772,7 @@ def plot_recommendations(recs, output_dir):
     fig, ax = plt.subplots(figsize=(11, 6))
     ax.barh(counts.index, counts.values)
     ax.set_title("Route-Month Recommendation Counts")
-    ax.set_xlabel("Route-months")
+    ax.set_xlabel("Number of route-months")
     ax.set_ylabel("Recommendation")
     fig.tight_layout()
     fig.savefig(output_dir / "plots" / "recommendation_counts.png", dpi=200)
@@ -752,8 +787,8 @@ def plot_top_candidates(recs, output_dir, title, filename, rec_names, top_n=15):
     fig, ax = plt.subplots(figsize=(12, 7))
     ax.barh(labels.iloc[::-1], p["ActionPriorityScore"].iloc[::-1])
     ax.set_title(title)
-    ax.set_xlabel("Priority Score")
-    ax.set_ylabel("Route-month")
+    ax.set_xlabel("Action priority score (unitless index)")
+    ax.set_ylabel("Route-month (city pair | YYYY-MM)")
     fig.tight_layout()
     fig.savefig(output_dir / "plots" / filename, dpi=200)
     plt.close(fig)
@@ -778,14 +813,14 @@ def plot_route_profiles(recs, output_dir, top_n=6):
 
         fig, ax1 = plt.subplots(figsize=(11, 5))
         ax1.plot(g["MonthStart"], g["Flights"], marker="o", label="Flights")
-        ax1.set_ylabel("Monthly Flights")
+        ax1.set_ylabel("Number of flights per month")
         ax1.set_xlabel("Month")
 
         ax2 = ax1.twinx()
         ax2.plot(g["MonthStart"], g["AvgPassengers"], marker="s", linestyle="--", label="Avg Passengers")
-        ax2.set_ylabel("Avg Passenger Proxy")
+        ax2.set_ylabel("Average passengers per flight (load proxy)")
 
-        ax1.set_title(f"Seasonal Frequency and Passenger Proxy: {route}")
+        ax1.set_title(f"Monthly Frequency and Passenger Load Proxy: {route}")
         fig.autofmt_xdate()
         fig.tight_layout()
         fig.savefig(output_dir / "plots" / f"route_profile_{safe_filename(route)}.png", dpi=200)
@@ -838,10 +873,10 @@ def print_design_summary(joined, recommendations, tow_regimes, load_regimes):
             print(f"Avg TOW: {r['AvgTOW_kg']:,.0f} kg vs median {r['MedianRouteTOW_kg']:,.0f} kg ({r['TowPctVsMedian']:.1%})")
             if pd.notna(r.get("E2FuelPerNMAdvantageVsE1", np.nan)):
                 print(f"Observed route E2 fuel advantage vs E1: {r['E2FuelPerNMAdvantageVsE1']:.1%}")
-            if pd.notna(r.get("EstimatedFuelSavedKg", np.nan)):
-                print(f"Estimated monthly fuel saved: {r['EstimatedFuelSavedKg']:,.0f} kg")
-                if pd.notna(r.get("EstimatedFuelSavedPercent", np.nan)):
-                    print(f"Estimated fuel reduction: {r['EstimatedFuelSavedPercent']:.1%}")
+            if pd.notna(r.get("EstimatedFuelSavedKgPerRouteMonth", np.nan)):
+                print(f"Estimated fuel saved for route-month: {r['EstimatedFuelSavedKgPerRouteMonth']:,.0f} kg")
+                if pd.notna(r.get("EstimatedFuelSavedPercentOfRouteMonthFuel", np.nan)):
+                    print(f"Estimated route-month fuel reduction: {r['EstimatedFuelSavedPercentOfRouteMonthFuel']:.1%}")
             print(f"Reason: {r['RecommendationReason']}")
 
 
